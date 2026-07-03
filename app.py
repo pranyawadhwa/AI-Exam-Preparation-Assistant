@@ -1,0 +1,2806 @@
+# # ==========================================================
+# # IMPORTS
+# # ==========================================================
+
+# import streamlit as st
+# import streamlit.components.v1 as components
+# from pypdf import PdfReader
+# from sentence_transformers import SentenceTransformer
+# import chromadb
+# import google.generativeai as genai
+# import os
+# import time
+# from datetime import datetime
+# from dotenv import load_dotenv
+
+
+# # ==========================================================
+# # LOAD ENVIRONMENT VARIABLES
+# # ==========================================================
+
+# load_dotenv()
+
+
+# # ==========================================================
+# # PAGE CONFIGURATION
+# # ==========================================================
+
+# st.set_page_config(
+#     page_title="AI Exam Preparation Assistant",
+#     page_icon="📘",
+#     layout="wide",
+#     initial_sidebar_state="expanded"
+# )
+
+
+# # ==========================================================
+# # GEMINI CONFIGURATION
+# # ==========================================================
+
+# genai.configure(
+#     api_key=os.getenv("GEMINI_API_KEY")
+# )
+
+# gemini_model = genai.GenerativeModel(
+#     "gemini-2.5-flash"
+# )
+
+
+# # ==========================================================
+# # LOAD EMBEDDING MODEL
+# # ==========================================================
+
+# @st.cache_resource
+# def load_model():
+#     return SentenceTransformer("all-MiniLM-L6-v2")
+
+# model = load_model()
+
+
+# # ==========================================================
+# # SESSION STATE
+# # ==========================================================
+
+# default_states = {
+#     "documents":        {},
+#     "collection_ready": False,
+#     "ai_responses":     0,
+#     "searches_done":    0,
+#     "summaries_done":   0,
+#     "search_scope":     "All Notes",
+#     "pending_delete":   None,
+#     "workspace_cards":  [],
+#     "focus_section":    None,
+#     "duplicate_notice": None,
+# }
+
+# for key, value in default_states.items():
+#     if key not in st.session_state:
+#         st.session_state[key] = value
+
+
+# # ==========================================================
+# # HELPER FUNCTIONS
+# # ==========================================================
+
+# def chunk_text(text, chunk_size=1000):
+#     chunks = []
+#     for i in range(0, len(text), chunk_size):
+#         chunks.append(text[i:i + chunk_size])
+#     return chunks
+
+
+# @st.cache_data
+# def process_pdf(file_bytes, file_name):
+#     import io
+#     reader = PdfReader(io.BytesIO(file_bytes))
+#     text = ""
+#     for page in reader.pages:
+#         extracted = page.extract_text()
+#         if extracted:
+#             text += extracted
+#     chunks = chunk_text(text)
+#     return chunks, len(reader.pages)
+
+
+# @st.cache_data
+# def generate_embeddings(chunks_tuple):
+#     chunks = list(chunks_tuple)
+#     embeddings = model.encode(chunks)
+#     return embeddings
+
+
+# def time_ago(timestamp_str):
+#     if not timestamp_str:
+#         return ""
+#     try:
+#         then = datetime.strptime(timestamp_str, "%H:%M")
+#         now  = datetime.now()
+#         diff = (now.hour * 60 + now.minute) - (then.hour * 60 + then.minute)
+#         if diff <= 0:
+#             return "just now"
+#         if diff == 1:
+#             return "1 min ago"
+#         return f"{diff} min ago"
+#     except Exception:
+#         return ""
+
+
+# def add_workspace_card(card_type, title, content, color):
+#     """Appends an independent card — never removes existing cards of any type."""
+#     card_id = f"{card_type}_{int(time.time()*1000)}"
+#     st.session_state.workspace_cards.append({
+#         "id":        card_id,
+#         "type":      card_type,
+#         "title":     title,
+#         "content":   content,
+#         "color":     color,
+#         "time":      datetime.now().strftime("%H:%M"),
+#         "collapsed": False,
+#     })
+#     st.session_state.ai_responses += 1
+
+
+# def show_error(error_type):
+#     messages = {
+#         "api_quota":      "⚠️ Gemini API quota exceeded. Please wait a few minutes and try again.",
+#         "api_key":        "🔑 Invalid or missing API key. Please check your .env file.",
+#         "no_answer":      "🔍 No relevant answer found in the uploaded notes.",
+#         "empty_question": "✏️ Please enter a question before searching.",
+#         "no_docs":        "📂 Please upload at least one PDF before using this feature.",
+#         "general":        "❌ Something went wrong. Please try again.",
+#     }
+#     st.error(messages.get(error_type, messages["general"]))
+
+
+# def handle_gemini_error(e):
+#     err = str(e).lower()
+#     if "quota" in err or "429" in err or "rate" in err:
+#         show_error("api_quota")
+#     elif "api_key" in err or "credential" in err or "401" in err:
+#         show_error("api_key")
+#     else:
+#         st.error(f"❌ Unexpected error: {e}")
+
+
+# def get_active_chunks():
+#     """Returns dict {filename: chunks} based on current search scope."""
+#     if st.session_state.search_scope == "All Notes":
+#         return {name: data["chunks"] for name, data in st.session_state.documents.items()}
+#     else:
+#         name = st.session_state.search_scope
+#         if name in st.session_state.documents:
+#             return {name: st.session_state.documents[name]["chunks"]}
+#         return {}
+
+
+# def delete_document(fname):
+#     """
+#     Fully removes a PDF and every trace of it:
+#     ChromaDB chunks/embeddings/metadata, session_state.documents,
+#     cached results, search_scope reset, file_uploader widget state.
+#     """
+#     client = chromadb.PersistentClient(path="./chroma_db")
+#     collection = client.get_or_create_collection(name="notes")
+#     existing = collection.get(where={"source": fname})
+#     if existing["ids"]:
+#         collection.delete(ids=existing["ids"])
+
+#     if fname in st.session_state.documents:
+#         del st.session_state.documents[fname]
+
+#     process_pdf.clear()
+#     generate_embeddings.clear()
+
+#     if st.session_state.search_scope == fname:
+#         st.session_state.search_scope = "All Notes"
+
+#     st.session_state.pop("pdf_uploader", None)
+
+#     if len(st.session_state.documents) == 0:
+#         st.session_state.collection_ready = False
+
+
+# # ==========================================================
+# # CUSTOM CSS
+# # ==========================================================
+
+# st.markdown("""
+# <style>
+
+# @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+# * { font-family: 'Inter', 'Segoe UI', sans-serif; box-sizing: border-box; }
+
+# .stApp { background: #0B0E18; }
+
+# section[data-testid="stSidebar"] {
+#     background: #10141F;
+#     border-right: 1px solid #1E2438;
+#     width: 240px !important;
+# }
+# section[data-testid="stSidebar"] * { color: #8A94A8 !important; }
+# section[data-testid="stSidebar"] h2,
+# section[data-testid="stSidebar"] h3 { color: #FFFFFF !important; font-weight: 700; }
+# section[data-testid="stSidebar"] hr { border-color: #1E2438 !important; margin: 10px 0; }
+# section[data-testid="stSidebar"] .stAlert {
+#     background: #161B2C !important;
+#     border: 1px solid #1E2438 !important;
+#     border-radius: 10px;
+# }
+
+# section[data-testid="stSidebar"] .stButton > button {
+#     background: transparent !important;
+#     border: none !important;
+#     color: #8A94A8 !important;
+#     text-align: left !important;
+#     justify-content: flex-start !important;
+#     padding: 8px 10px !important;
+#     height: auto !important;
+#     font-size: 13px !important;
+#     font-weight: 500 !important;
+#     border-radius: 8px !important;
+#     box-shadow: none !important;
+# }
+# section[data-testid="stSidebar"] .stButton > button:hover {
+#     background: rgba(45,116,218,0.12) !important;
+#     color: #5B9BF8 !important;
+#     transform: none !important;
+# }
+
+# .block-container { padding: 1.2rem 2rem 2rem 2rem; max-width: 1400px; }
+# .stApp, .stApp p, .stApp label { color: #CBD5E1; }
+
+# .app-header {
+#     background: linear-gradient(130deg, #1246CC 0%, #2D74DA 55%, #5B9BF8 100%);
+#     padding: 28px 40px;
+#     border-radius: 18px;
+#     margin-bottom: 14px;
+#     box-shadow: 0 6px 40px rgba(18,70,204,0.4);
+#     position: relative;
+#     overflow: hidden;
+# }
+# .app-header::after {
+#     content: '📘';
+#     position: absolute;
+#     right: 40px; top: 50%;
+#     transform: translateY(-50%);
+#     font-size: 72px;
+#     opacity: 0.12;
+# }
+# .app-header-greeting {
+#     font-size: 13px; font-weight: 600; color: #A8C8FF;
+#     letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 4px;
+# }
+# .app-header h1 {
+#     margin: 0 0 6px 0; font-size: 28px; font-weight: 800;
+#     color: #FFFFFF; letter-spacing: -0.5px;
+# }
+# .app-header p { margin: 0; font-size: 15px; color: #C8DEFF; max-width: 560px; line-height: 1.55; }
+
+# .card {
+#     background: #131826; border: 1px solid #1E2438;
+#     border-radius: 16px; padding: 22px; height: 100%;
+# }
+# .card-title {
+#     font-size: 15px; font-weight: 700; color: #FFFFFF;
+#     margin-bottom: 16px; letter-spacing: -0.1px;
+# }
+
+# .empty-state { text-align: center; padding: 28px 16px; color: #3A4560; }
+# .empty-state-icon { font-size: 36px; margin-bottom: 10px; }
+# .empty-state-text { font-size: 13px; color: #4A5578; line-height: 1.5; }
+
+# .note-item {
+#     background: #0A1F14; border: 1px solid #1A5C38;
+#     border-radius: 12px; padding: 12px 14px; margin-bottom: 8px;
+# }
+# .note-item-name {
+#     font-size: 13px; font-weight: 600; color: #4ADE80; margin-bottom: 3px;
+#     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+# }
+# .note-item-meta { font-size: 11px; color: #5A7A60; }
+
+# .compact-notice {
+#     background: #161B2C; border: 1px solid #2A3555;
+#     border-radius: 8px; padding: 6px 12px;
+#     font-size: 12px; color: #7B88A0; margin-top: 6px;
+# }
+
+# .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+# .stat-box {
+#     background: #0B0E18; border: 1px solid #1E2438;
+#     border-radius: 10px; padding: 12px 10px; text-align: center; transition: border-color 0.2s;
+# }
+# .stat-box:hover { border-color: #2D74DA; }
+# .stat-val { font-size: 22px; font-weight: 700; color: #4F8EF7; line-height: 1; }
+# .stat-lbl { font-size: 11px; color: #5A6880; margin-top: 3px; font-weight: 500; }
+
+# .badge { display: inline-block; border-radius: 20px; padding: 2px 10px; font-size: 11px; font-weight: 600; }
+# .badge-ready  { background:#0A1F14; color:#4ADE80; border:1px solid #1A5C38; }
+# .badge-waiting{ background:#1A140A; color:#FBBF24; border:1px solid #5C4010; }
+
+# .section-heading {
+#     font-size: 19px; font-weight: 700; color: #FFFFFF;
+#     margin: 14px 0 10px 0; letter-spacing: -0.3px;
+#     display: flex; align-items: center; gap: 8px;
+# }
+
+# .ask-bar-card {
+#     background: #131826; border: 1px solid #1E2438;
+#     border-radius: 16px; padding: 22px; margin-bottom: 16px;
+# }
+
+# .tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+# .tool-card {
+#     background: #131826; border: 1px solid #1E2438;
+#     border-radius: 14px; padding: 18px 16px;
+#     transition: border-color 0.2s, background 0.2s; cursor: pointer;
+# }
+# .tool-card:hover { border-color: #2D74DA; background: #161D30; }
+# .tool-card-icon  { font-size: 22px; margin-bottom: 8px; }
+# .tool-card-title { font-size: 14px; font-weight: 700; color: #FFFFFF; margin-bottom: 3px; }
+# .tool-card-desc  { font-size: 12px; color: #5A6880; line-height: 1.4; }
+
+# .stButton > button {
+#     width: 100%; height: 44px; border-radius: 10px;
+#     background: #1A56DB; color: #FFFFFF !important;
+#     font-size: 14px; font-weight: 600; border: none;
+#     transition: background 0.2s, transform 0.1s;
+# }
+# .stButton > button:hover { background: #1446BF; transform: translateY(-1px); }
+# .stButton > button:active { transform: translateY(0); }
+
+# .clear-all-btn > button {
+#     background: transparent !important; border: 1px solid #2A1A1A !important;
+#     color: #F87171 !important; height: 36px !important; font-size: 13px !important;
+# }
+# .clear-all-btn > button:hover { background: #1A0A0A !important; }
+
+# .delete-note-btn > button {
+#     background: transparent !important; border: 1px solid #2A1A1A !important;
+#     color: #F87171 !important; height: 32px !important; font-size: 12px !important;
+# }
+# .delete-note-btn > button:hover { background: #1A0A0A !important; }
+
+# .stTextInput > div > div > input {
+#     border-radius: 10px; background: #0B0E18 !important;
+#     border: 1px solid #1E2438 !important; color: #E2E8F0 !important;
+#     font-size: 15px; padding: 10px 14px;
+# }
+# .stTextInput > div > div > input::placeholder { color: #3A4560 !important; }
+# .stTextInput > div > div > input:focus {
+#     border-color: #2D74DA !important;
+#     box-shadow: 0 0 0 2px rgba(45,116,218,0.2) !important;
+# }
+
+# .stSelectbox > div > div {
+#     background: #0B0E18 !important; border: 1px solid #1E2438 !important;
+#     border-radius: 10px !important; color: #E2E8F0 !important;
+# }
+
+# [data-testid="stFileUploader"] {
+#     background: #0B0E18; border: 2px dashed #1E2438;
+#     border-radius: 12px; padding: 6px; transition: border-color 0.2s;
+# }
+# [data-testid="stFileUploader"]:hover { border-color: #2D74DA; }
+# [data-testid="stFileUploader"] * { color: #4A5578 !important; }
+
+# .workspace-title { font-size: 17px; font-weight: 700; color: #FFFFFF; }
+# .workspace-sub   { font-size: 12px; color: #4A5578; margin-top: 2px; }
+
+# .study-card {
+#     border-radius: 14px;
+#     border-left-width: 3px; border-left-style: solid;
+#     border-top: 1px solid #1E2438; border-right: 1px solid #1E2438;
+#     border-bottom: 1px solid #1E2438;
+#     background: #131826; margin-bottom: 14px; overflow: hidden;
+# }
+# .study-card-header {
+#     display: flex; align-items: center;
+#     justify-content: space-between; padding: 14px 18px;
+# }
+# .study-card-left { display: flex; align-items: center; gap: 10px; }
+# .study-card-title{ font-size: 14px; font-weight: 700; color: #FFFFFF; }
+# .study-card-time { font-size: 11px; color: #3A4560; margin-top: 2px; }
+# .study-card-body { padding: 0 18px 18px 18px; color: #C9D1E0; font-size: 14px; line-height: 1.7; }
+# .study-card-divider { height: 1px; background: #1E2438; margin: 0 18px; }
+
+# .card-answer       { border-left-color: #2D74DA; }
+# .card-summary      { border-left-color: #10B981; }
+# .card-questions    { border-left-color: #F59E0B; }
+# .card-mcqs         { border-left-color: #8B5CF6; }
+# .card-memorytricks { border-left-color: #F43F5E; }
+
+# .copy-toast {
+#     background: #0A1F14; border: 1px solid #1A5C38; color: #4ADE80;
+#     border-radius: 8px; padding: 6px 12px; font-size: 12px;
+#     text-align: center; margin-bottom: 8px;
+# }
+
+# .nav-section {
+#     font-size: 10px; font-weight: 700; color: #2A3555 !important;
+#     letter-spacing: 1.2px; text-transform: uppercase; padding: 6px 0 4px 0;
+# }
+# .nav-item {
+#     padding: 8px 10px; border-radius: 8px; margin-bottom: 2px;
+#     font-size: 13px; font-weight: 500; color: #8A94A8 !important;
+#     display: flex; align-items: center; gap: 8px;
+# }
+# .nav-active {
+#     background: rgba(45,116,218,0.15) !important;
+#     color: #5B9BF8 !important;
+#     border-left: 2px solid #2D74DA; padding-left: 8px;
+# }
+# .nav-disabled { color: #2A3555 !important; cursor: not-allowed; }
+# .soon-badge {
+#     font-size: 9px; background: #161B2C; color: #3A4560 !important;
+#     border: 1px solid #1E2438; border-radius: 20px;
+#     padding: 1px 6px; margin-left: auto;
+# }
+# .version-box {
+#     background: #0B0E18; border: 1px solid #1E2438;
+#     border-radius: 10px; padding: 12px 14px; margin-top: 6px;
+# }
+# .version-row { display: flex; justify-content: space-between; font-size: 11px; color: #3A4560; margin-bottom: 3px; }
+# .version-val { color: #6A7A98 !important; }
+
+# [data-testid="stExpander"] {
+#     background: #131826 !important; border: 1px solid #1E2438 !important; border-radius: 10px !important;
+# }
+# .streamlit-expanderHeader { color: #CBD5E1 !important; background: #131826 !important; }
+
+# [data-testid="metric-container"] {
+#     background: #0B0E18; border-radius: 10px; padding: 12px; border: 1px solid #1E2438;
+# }
+# [data-testid="metric-container"] label { color: #4A5578 !important; font-size: 12px; }
+# [data-testid="stMetricValue"] { color: #4F8EF7 !important; font-weight: 700; }
+
+# .stSpinner > div { border-top-color: #2D74DA !important; }
+# hr { border-color: #1E2438 !important; margin: 12px 0; }
+# h2, h3 { color: #FFFFFF !important; }
+# .stAlert { border-radius: 10px; }
+
+# ::-webkit-scrollbar { width: 5px; height: 5px; }
+# ::-webkit-scrollbar-track { background: #0B0E18; }
+# ::-webkit-scrollbar-thumb { background: #1E2438; border-radius: 4px; }
+# ::-webkit-scrollbar-thumb:hover { background: #2A3450; }
+
+# .app-footer {
+#     text-align: center; padding: 16px 0 8px 0;
+#     border-top: 1px solid #1E2438; margin-top: 16px;
+#     font-size: 12px; color: #2A3555;
+# }
+
+# </style>
+# """, unsafe_allow_html=True)
+
+
+# # ==========================================================
+# # SIDEBAR
+# # ==========================================================
+
+# with st.sidebar:
+#     st.markdown("## 📘 Exam Assistant")
+#     st.caption("Your personal study companion")
+#     st.divider()
+
+#     st.markdown('<div class="nav-section">Notes</div>', unsafe_allow_html=True)
+#     st.markdown('<div class="nav-item nav-active">📂 Upload Notes</div>', unsafe_allow_html=True)
+#     st.markdown('<div class="nav-item nav-disabled">📚 Notes Library <span class="soon-badge">Soon</span></div>', unsafe_allow_html=True)
+
+#     st.markdown('<div class="nav-section" style="margin-top:8px">Study Tools</div>', unsafe_allow_html=True)
+
+#     if st.button("❓ Ask Questions", key="nav_ask", use_container_width=True):
+#         st.session_state.focus_section = "ask"
+#         st.rerun()
+#     if st.button("📝 Summary", key="nav_summary", use_container_width=True):
+#         st.session_state.focus_section = "summary"
+#         st.rerun()
+#     if st.button("🎯 MCQs", key="nav_mcqs", use_container_width=True):
+#         st.session_state.focus_section = "mcqs"
+#         st.rerun()
+
+#     # ── CHANGED: Flashcards → Memory Tricks ──
+#     if st.button("🧠 Memory Tricks", key="nav_memory_tricks", use_container_width=True):
+#         st.session_state.focus_section = "memory_tricks"
+#         st.rerun()
+
+#     st.markdown('<div class="nav-item nav-disabled">📅 Study Planner <span class="soon-badge">Soon</span></div>', unsafe_allow_html=True)
+#     st.markdown('<div class="nav-item nav-disabled">🗺️ Mind Map <span class="soon-badge">Soon</span></div>', unsafe_allow_html=True)
+
+#     st.markdown('<div class="nav-section" style="margin-top:8px">Activity</div>', unsafe_allow_html=True)
+
+#     if st.button("🕐 History", key="nav_history", use_container_width=True):
+#         st.session_state.focus_section = "history"
+#         st.rerun()
+#     if st.button("⚙️ Settings", key="nav_settings", use_container_width=True):
+#         st.session_state.focus_section = "settings"
+#         st.rerun()
+
+#     st.divider()
+
+#     st.markdown("### Project Info")
+#     st.markdown("""
+#     <div class="version-box">
+#         <div class="version-row">Version  <span class="version-val">1.2.0</span></div>
+#         <div class="version-row">Day      <span class="version-val">16 / 30</span></div>
+#         <div class="version-row">Status   <span style="color:#4ADE80 !important">● Active</span></div>
+#     </div>
+#     """, unsafe_allow_html=True)
+
+#     st.write("")
+#     st.info("Upload your notes and let AI help you study smarter.")
+
+
+# # ==========================================================
+# # HEADER
+# # ==========================================================
+
+# hour = datetime.now().hour
+# greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
+
+# st.markdown(f"""
+# <div class="app-header">
+#     <div class="app-header-greeting">{greeting}, Student</div>
+#     <h1>Ready to Study?</h1>
+#     <p>Upload your notes, ask questions, generate summaries, practice questions and MCQs — all powered by AI.</p>
+# </div>
+# """, unsafe_allow_html=True)
+
+
+# # ==========================================================
+# # TOP CARDS ROW
+# # ==========================================================
+
+# col_upload, col_recent, col_stats = st.columns([1.4, 1.3, 1])
+
+
+# # ── Card 1: Upload ──
+
+# with col_upload:
+#     st.markdown('<div class="card">', unsafe_allow_html=True)
+#     st.markdown('<div class="card-title">📂 Upload Notes</div>', unsafe_allow_html=True)
+
+#     uploaded_files = st.file_uploader(
+#         "Upload PDFs",
+#         type=["pdf"],
+#         label_visibility="collapsed",
+#         accept_multiple_files=True,
+#         key="pdf_uploader"
+#     )
+
+#     if not uploaded_files:
+#         st.markdown("""
+#         <div class="empty-state">
+#             <div class="empty-state-icon">📄</div>
+#             <div class="empty-state-text">Drag your PDFs here<br>or click Browse Files<br><br>Supported: PDF &nbsp;•&nbsp; Max 200 MB each</div>
+#         </div>
+#         """, unsafe_allow_html=True)
+
+#     if st.session_state.duplicate_notice:
+#         st.markdown(
+#             f'<div class="compact-notice">ℹ️ {st.session_state.duplicate_notice} already exists</div>',
+#             unsafe_allow_html=True
+#         )
+#         st.session_state.duplicate_notice = None
+
+#     st.markdown("</div>", unsafe_allow_html=True)
+
+
+# # ── Card 2: Uploaded Notes List ──
+
+# with col_recent:
+#     st.markdown('<div class="card">', unsafe_allow_html=True)
+#     st.markdown('<div class="card-title">📄 Uploaded Notes</div>', unsafe_allow_html=True)
+
+#     if st.session_state.documents:
+#         for fname, data in list(st.session_state.documents.items()):
+
+#             if st.session_state.pending_delete == fname:
+#                 st.markdown(f"""
+#                 <div class="note-item" style="border-color:#5C2626; background:#1A0A0A;">
+#                     <div class="note-item-name" style="color:#F87171;">⚠️ Delete {fname}?</div>
+#                     <div class="note-item-meta">This will remove the file and its study material.</div>
+#                 </div>
+#                 """, unsafe_allow_html=True)
+
+#                 dc1, dc2 = st.columns(2)
+#                 with dc1:
+#                     if st.button("✅ Yes, Delete", key=f"confirm_{fname}", use_container_width=True):
+#                         delete_document(fname)
+#                         st.session_state.pending_delete = None
+#                         st.rerun()
+#                 with dc2:
+#                     if st.button("✖ Cancel", key=f"cancel_{fname}", use_container_width=True):
+#                         st.session_state.pending_delete = None
+#                         st.rerun()
+
+#             else:
+#                 nc1, nc2 = st.columns([4, 1])
+#                 with nc1:
+#                     st.markdown(f"""
+#                     <div class="note-item">
+#                         <div class="note-item-name" title="{fname}">✅ {fname}</div>
+#                         <div class="note-item-meta">{data['pages']} pages &nbsp;•&nbsp; {data['file_size']} KB &nbsp;•&nbsp; {time_ago(data['upload_time'])}</div>
+#                     </div>
+#                     """, unsafe_allow_html=True)
+#                 with nc2:
+#                     st.markdown('<div class="delete-note-btn">', unsafe_allow_html=True)
+#                     if st.button("🗑", key=f"delnote_{fname}", use_container_width=True):
+#                         st.session_state.pending_delete = fname
+#                         st.rerun()
+#                     st.markdown("</div>", unsafe_allow_html=True)
+
+#     else:
+#         st.markdown("""
+#         <div class="empty-state">
+#             <div class="empty-state-icon">📭</div>
+#             <div class="empty-state-text">No notes uploaded yet.<br>Upload your first PDF to begin studying.</div>
+#         </div>
+#         """, unsafe_allow_html=True)
+
+#     st.markdown("</div>", unsafe_allow_html=True)
+
+
+# # ── Card 3: Stats ──
+
+# with col_stats:
+#     st.markdown('<div class="card">', unsafe_allow_html=True)
+#     st.markdown('<div class="card-title">📊 Statistics</div>', unsafe_allow_html=True)
+
+#     db_badge = (
+#         '<span class="badge badge-ready">● Ready</span>'
+#         if st.session_state.collection_ready
+#         else '<span class="badge badge-waiting">○ Waiting</span>'
+#     )
+
+#     total_pages = sum(d["pages"] for d in st.session_state.documents.values())
+
+#     st.markdown(f"""
+#     <div class="stat-grid">
+#         <div class="stat-box">
+#             <div class="stat-val">{len(st.session_state.documents)}</div>
+#             <div class="stat-lbl">Notes</div>
+#         </div>
+#         <div class="stat-box">
+#             <div class="stat-val">{total_pages}</div>
+#             <div class="stat-lbl">Pages</div>
+#         </div>
+#         <div class="stat-box">
+#             <div class="stat-val">{st.session_state.searches_done}</div>
+#             <div class="stat-lbl">AI Searches</div>
+#         </div>
+#         <div class="stat-box">
+#             <div class="stat-val">{st.session_state.summaries_done}</div>
+#             <div class="stat-lbl">Summaries</div>
+#         </div>
+#     </div>
+#     <div style="text-align:center; margin-top:8px; font-size:12px; color:#4A5578;">
+#         Study Material &nbsp;{db_badge}
+#     </div>
+#     """, unsafe_allow_html=True)
+
+#     st.markdown("</div>", unsafe_allow_html=True)
+
+
+# # ==========================================================
+# # PDF PROCESSING
+# # ==========================================================
+
+# if uploaded_files:
+
+#     client     = chromadb.PersistentClient(path="./chroma_db")
+#     collection = client.get_or_create_collection(name="notes")
+
+#     new_files_processed = False
+
+#     for uploaded_file in uploaded_files:
+
+#         if uploaded_file.name in st.session_state.documents:
+#             st.session_state.duplicate_notice = uploaded_file.name
+#             continue
+
+#         file_bytes   = uploaded_file.read()
+#         file_size_kb = round(len(file_bytes) / 1024, 1)
+
+#         with st.status(f"⚙️ Preparing {uploaded_file.name}...", expanded=True) as status:
+#             st.write("📖 Reading PDF...")
+#             chunks, num_pages = process_pdf(file_bytes, uploaded_file.name)
+
+#             st.write("🧮 Processing content...")
+#             embeddings = generate_embeddings(tuple(chunks))
+
+#             st.write("🗄️ Adding to search index...")
+
+#             collection.add(
+#                 documents=chunks,
+#                 embeddings=embeddings.tolist(),
+#                 metadatas=[{"source": uploaded_file.name} for _ in chunks],
+#                 ids=[f"{uploaded_file.name}_{i}" for i in range(len(chunks))]
+#             )
+
+#             st.session_state.documents[uploaded_file.name] = {
+#                 "chunks":        chunks,
+#                 "pages":         num_pages,
+#                 "file_size":     file_size_kb,
+#                 "upload_time":   datetime.now().strftime("%H:%M"),
+#                 "embedding_dim": len(embeddings[0]),
+#             }
+#             st.session_state.collection_ready = True
+#             new_files_processed = True
+
+#             status.update(label=f"✅ {uploaded_file.name} ready!", state="complete", expanded=False)
+
+#     if new_files_processed:
+#         st.rerun()
+
+
+# # ==========================================================
+# # HISTORY / SETTINGS PLACEHOLDER PAGES
+# # ==========================================================
+
+# if st.session_state.focus_section == "history":
+#     st.info("🕐 History page is coming soon.")
+#     st.session_state.focus_section = None
+
+# if st.session_state.focus_section == "settings":
+#     st.info("⚙️ Settings page is coming soon.")
+#     st.session_state.focus_section = None
+
+
+# # ==========================================================
+# # MAIN WORKSPACE
+# # ==========================================================
+
+# if st.session_state.documents:
+
+#     st.markdown('<div class="section-heading">⚙️ Study Workspace</div>', unsafe_allow_html=True)
+
+#     left_panel, right_panel = st.columns([0.62, 1.0])
+
+
+#     # ── LEFT PANEL ──
+
+#     with left_panel:
+
+#         # Focus indicators — shown once then cleared
+#         if st.session_state.focus_section in ("ask", "summary", "mcqs", "memory_tricks"):
+#             labels = {
+#                 "ask":           "👆 Ask Questions",
+#                 "summary":       "👆 Summary",
+#                 "mcqs":          "👆 MCQs",
+#                 "memory_tricks": "👆 Memory Tricks",
+#             }
+#             st.markdown(
+#                 f'<div style="color:#4F8EF7; font-size:12px; margin-bottom:4px;">{labels[st.session_state.focus_section]}</div>',
+#                 unsafe_allow_html=True
+#             )
+#             st.session_state.focus_section = None
+
+#         # ── Ask bar ──
+#         st.markdown('<div class="ask-bar-card">', unsafe_allow_html=True)
+#         st.markdown('<div class="card-title">💬 Ask a Question</div>', unsafe_allow_html=True)
+
+#         scope_options = ["All Notes"] + list(st.session_state.documents.keys())
+
+#         if st.session_state.search_scope not in scope_options:
+#             st.session_state.search_scope = "All Notes"
+
+#         st.session_state.search_scope = st.selectbox(
+#             "Search In",
+#             options=scope_options,
+#             index=scope_options.index(st.session_state.search_scope)
+#         )
+
+#         question = st.text_input(
+#             "",
+#             placeholder="Ask anything from your uploaded notes...",
+#             key="question_input"
+#         )
+
+#         search_clicked = st.button("🔍 Search Notes", use_container_width=True)
+#         st.markdown("</div>", unsafe_allow_html=True)
+
+#         # ── Tool cards (CHANGED: Flashcards → Memory Tricks) ──
+#         st.markdown("""
+#         <div class="tool-grid">
+#             <div class="tool-card">
+#                 <div class="tool-card-icon">📝</div>
+#                 <div class="tool-card-title">Study Summary</div>
+#                 <div class="tool-card-desc">Key concepts from your notes</div>
+#             </div>
+#             <div class="tool-card">
+#                 <div class="tool-card-icon">❓</div>
+#                 <div class="tool-card-title">Practice Questions</div>
+#                 <div class="tool-card-desc">Short & long answer questions</div>
+#             </div>
+#             <div class="tool-card">
+#                 <div class="tool-card-icon">🎯</div>
+#                 <div class="tool-card-title">MCQ Practice</div>
+#                 <div class="tool-card-desc">10 multiple choice questions</div>
+#             </div>
+#             <div class="tool-card">
+#                 <div class="tool-card-icon">🧠</div>
+#                 <div class="tool-card-title">Memory Tricks</div>
+#                 <div class="tool-card-desc">Mnemonics & exam shortcuts</div>
+#             </div>
+#         </div>
+#         """, unsafe_allow_html=True)
+
+#         # ── Tool buttons (CHANGED: Flashcards → Memory Tricks) ──
+#         t1, t2 = st.columns(2)
+#         with t1:
+#             summary_clicked   = st.button("📝 Generate Summary",    use_container_width=True)
+#         with t2:
+#             questions_clicked = st.button("❓ Practice Questions",  use_container_width=True)
+
+#         t3, t4 = st.columns(2)
+#         with t3:
+#             mcq_clicked           = st.button("🎯 Generate MCQs",        use_container_width=True)
+#         with t4:
+#             memory_tricks_clicked = st.button("🧠 Memory Tricks",         use_container_width=True)
+
+
+#     # ── RIGHT PANEL ──
+
+#     with right_panel:
+
+#         ws_col1, ws_col2 = st.columns([2, 1])
+#         with ws_col1:
+#             st.markdown("""
+#             <div class="workspace-title">🗂️ Study Workspace</div>
+#             <div class="workspace-sub">Generated study material appears here as cards.</div>
+#             """, unsafe_allow_html=True)
+#         with ws_col2:
+#             st.markdown('<div class="clear-all-btn">', unsafe_allow_html=True)
+#             if st.button("🗑️ Clear All", use_container_width=True):
+#                 st.session_state.workspace_cards = []
+#                 st.session_state.searches_done   = 0
+#                 st.session_state.summaries_done  = 0
+#                 st.session_state.ai_responses    = 0
+#                 st.rerun()
+#             st.markdown("</div>", unsafe_allow_html=True)
+
+#         # ── Search ──
+#         if search_clicked:
+#             if not question.strip():
+#                 show_error("empty_question")
+#             else:
+#                 client     = chromadb.PersistentClient(path="./chroma_db")
+#                 collection = client.get_or_create_collection(name="notes")
+
+#                 query_filter = None
+#                 if st.session_state.search_scope != "All Notes":
+#                     query_filter = {"source": st.session_state.search_scope}
+
+#                 with st.spinner("🔍 Searching your notes..."):
+#                     query_embedding = model.encode(question)
+#                     results = collection.query(
+#                         query_embeddings=[query_embedding.tolist()],
+#                         n_results=3,
+#                         include=["documents", "distances", "metadatas"],
+#                         where=query_filter
+#                     )
+
+#                 if not results["documents"][0]:
+#                     show_error("no_answer")
+#                 else:
+#                     context = "\n\n".join(results["documents"][0])
+#                     prompt = f"""
+# You are an expert AI Exam Preparation Assistant.
+
+# Answer the student's question using ONLY the provided notes.
+
+# Rules:
+# - Read all retrieved notes carefully before answering.
+# - The answer may require combining information from multiple sections.
+# - Do not rely on exact keyword matching.
+# - Infer the correct answer whenever it is clearly supported by the notes.
+# - Never use outside knowledge.
+# - If multiple important points exist, present them as bullet points.
+# - Keep the explanation clear, structured, and exam-oriented.
+# - Highlight definitions, important concepts, advantages, disadvantages, steps, formulas, or examples whenever available in the notes.
+# - If the notes do not contain enough information to answer confidently, reply exactly:
+# "The answer is not available in the uploaded notes."
+
+# Retrieved Notes:
+# {context}
+
+# Question:
+# {question}
+
+# Answer:
+# """
+#                     try:
+#                         with st.spinner("🤖 Generating answer..."):
+#                             response = gemini_model.generate_content(prompt)
+
+#                         answer_text = response.text + "\n\n---\n**Sources:**\n"
+#                         for i, (doc, dist, meta) in enumerate(zip(
+#                             results["documents"][0],
+#                             results["distances"][0],
+#                             results["metadatas"][0]
+#                         )):
+#                             confidence  = "High" if dist < 0.5 else ("Medium" if dist < 1.0 else "Low")
+#                             source_name = meta.get("source", "Unknown")
+#                             answer_text += f"\n**Source {i+1}** — {source_name} — Confidence: {confidence}\n> {doc[:200]}...\n"
+
+#                         add_workspace_card("answer", "💬 Answer", answer_text, "card-answer")
+#                         st.session_state.searches_done += 1
+#                         st.rerun()
+
+#                     except Exception as e:
+#                         handle_gemini_error(e)
+
+#         # ── Summary ──
+#         if summary_clicked:
+#             active_chunks = get_active_chunks()
+#             if not active_chunks:
+#                 show_error("no_docs")
+#             else:
+#                 try:
+#                     with st.spinner("📝 Generating study summary..."):
+#                         full_summary = ""
+#                         for doc_name, doc_chunks in active_chunks.items():
+#                             summary_context = "\n\n".join(doc_chunks)
+#                             summary_prompt = f"""
+# You are an AI Exam Preparation Assistant.
+# Create a concise study summary from the notes.
+# Focus on: Main concepts, Important ideas, Key points, Exam-relevant information.
+
+# Notes:
+# {summary_context}
+
+# Summary:
+# """
+#                             resp = gemini_model.generate_content(summary_prompt)
+#                             if len(active_chunks) > 1:
+#                                 full_summary += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+#                             else:
+#                                 full_summary += resp.text
+
+#                     add_workspace_card("summary", "📝 Study Summary", full_summary, "card-summary")
+#                     st.session_state.summaries_done += 1
+#                     st.rerun()
+#                 except Exception as e:
+#                     handle_gemini_error(e)
+
+#         # ── Questions ──
+#         if questions_clicked:
+#             active_chunks = get_active_chunks()
+#             if not active_chunks:
+#                 show_error("no_docs")
+#             else:
+#                 try:
+#                     with st.spinner("❓ Generating practice questions..."):
+#                         full_questions = ""
+#                         for doc_name, doc_chunks in active_chunks.items():
+#                             questions_context = "\n\n".join(doc_chunks)
+#                             questions_prompt = f"""
+# You are an AI Exam Preparation Assistant.
+# Generate important exam-oriented questions from the provided notes.
+# Requirements:
+# - Generate exactly 5 Short Answer Questions.
+# - Generate exactly 5 Long Answer Questions.
+# - Do not provide answers.
+# - Questions should be based only on the notes.
+# - Focus on concepts important for university exams.
+
+# Output Format:
+# SHORT ANSWER QUESTIONS
+# 1. ...
+# 2. ...
+# 3. ...
+# 4. ...
+# 5. ...
+
+# LONG ANSWER QUESTIONS
+# 1. ...
+# 2. ...
+# 3. ...
+# 4. ...
+# 5. ...
+
+# Notes:
+# {questions_context}
+
+# Questions:
+# """
+#                             resp = gemini_model.generate_content(questions_prompt)
+#                             if len(active_chunks) > 1:
+#                                 full_questions += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+#                             else:
+#                                 full_questions += resp.text
+
+#                     add_workspace_card("questions", "❓ Practice Questions", full_questions, "card-questions")
+#                     st.rerun()
+#                 except Exception as e:
+#                     handle_gemini_error(e)
+
+#         # ── MCQs ──
+#         if mcq_clicked:
+#             active_chunks = get_active_chunks()
+#             if not active_chunks:
+#                 show_error("no_docs")
+#             else:
+#                 try:
+#                     with st.spinner("🎯 Generating MCQs..."):
+#                         full_mcqs = ""
+#                         for doc_name, doc_chunks in active_chunks.items():
+#                             mcq_context = "\n\n".join(doc_chunks)
+#                             mcq_prompt = f"""
+# You are an AI Exam Preparation Assistant.
+# Generate exactly 10 multiple-choice questions from the provided notes.
+# Requirements:
+# - Questions must be based only on the notes.
+# - Generate exactly 10 MCQs.
+# - Each question must have exactly 4 options labeled A. B. C. D.
+# - Put every option on a separate line.
+# - Leave one blank line after each option.
+# - After options write: Answer: X
+
+# Example:
+# Q1. Question
+
+# A. Option 1
+
+# B. Option 2
+
+# C. Option 3
+
+# D. Option 4
+
+# Answer: B
+
+# Notes:
+# {mcq_context}
+
+# MCQs:
+# """
+#                             resp = gemini_model.generate_content(mcq_prompt)
+#                             if len(active_chunks) > 1:
+#                                 full_mcqs += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+#                             else:
+#                                 full_mcqs += resp.text
+
+#                     add_workspace_card("mcqs", "🎯 MCQ Practice", full_mcqs, "card-mcqs")
+#                     st.rerun()
+#                 except Exception as e:
+#                     handle_gemini_error(e)
+
+#         # ── Memory Tricks (CHANGED: replaces Flashcards entirely) ──
+#         if memory_tricks_clicked:
+#             active_chunks = get_active_chunks()
+#             if not active_chunks:
+#                 show_error("no_docs")
+#             else:
+#                 try:
+#                     with st.spinner("🧠 Generating Memory Tricks..."):
+#                         full_memory_tricks = ""
+#                         for doc_name, doc_chunks in active_chunks.items():
+#                             memory_context = "\n\n".join(doc_chunks)
+#                             memory_prompt = f"""
+# You are an expert exam mentor helping university students remember topics quickly.
+# Your task is to create highly memorable Memory Tricks from the provided notes.
+# The goal is NOT to summarize the chapter.
+# The goal is to help students remember difficult concepts during exams.
+# Generate only information that actually exists in the notes.
+# If a topic does not naturally support a mnemonic, create another memory technique instead.
+
+# Use the following techniques wherever appropriate:
+
+# 1. Acronyms
+# Create memorable acronyms from important concepts.
+# Example:
+# SMART
+# S – Smart Contracts
+# M – Market Access
+# A – Automation
+# R – Reputation
+# T – Transparency
+
+# 2. Mnemonics
+# Example:
+# Remember "SCALE"
+# S → SAR
+# C → CNN
+# A → Adam Optimizer
+# L → Lee Filter
+# E → Evaluation Metrics
+
+# 3. Memory Sentences
+# Example:
+# "Smart Workers Build Trust"
+# Smart → Smart Contracts
+# Workers → Work Ledger
+# Build → Blockchain
+# Trust → Transparency
+
+# 4. Number Tricks
+# Highlight important years, percentages and values.
+# Example:
+# 80% → Informal Workforce
+# 400 Million → Workers
+# 455 Billion → Gig Economy
+
+# 5. Compare Similar Concepts
+# Example:
+# Blockchain
+# ✓ Stores work history
+# ✓ Cannot be changed
+# Traditional Database
+# ✓ Centralized
+# ✓ Can be modified
+
+# 6. Exam Keywords
+# List only the words students should remember.
+# Example:
+# Immutable Ledger
+# Digital Identity
+# Smart Contracts
+# Portable Reputation
+# Transparency
+
+# 7. Frequently Confused Concepts
+# If two concepts are similar, explain how to differentiate them in one line.
+
+# 8. Must Remember Before Exam
+# Generate 5–10 extremely important facts that students should remember just before entering the exam hall.
+
+# Requirements:
+# - Generate between 8 and 15 memory tricks.
+# - Make every trick different.
+# - Use headings.
+# - Use bullet points.
+# - Make the output attractive and easy to revise.
+# - Do not generate questions.
+# - Do not generate flashcards.
+# - Do not explain every topic in detail.
+# - Keep every trick short.
+# - Everything must come only from the provided notes.
+
+# Notes:
+# {memory_context}
+
+# Memory Tricks:
+# """
+#                             resp = gemini_model.generate_content(memory_prompt)
+#                             if len(active_chunks) > 1:
+#                                 full_memory_tricks += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+#                             else:
+#                                 full_memory_tricks += resp.text
+
+#                     add_workspace_card(
+#                         "memorytricks", "🧠 Memory Tricks", full_memory_tricks, "card-memorytricks"
+#                     )
+#                     st.rerun()
+#                 except Exception as e:
+#                     handle_gemini_error(e)
+
+#         # ── Render Workspace Cards ──
+
+#         if not st.session_state.workspace_cards:
+#             st.markdown("""
+#             <div class="empty-state" style="padding:40px 20px; background:#131826;
+#                 border:1px solid #1E2438; border-radius:14px;">
+#                 <div class="empty-state-icon">🗂️</div>
+#                 <div class="empty-state-text">
+#                     Your study workspace is empty.<br>
+#                     Ask a question or generate study material<br>to see cards appear here.
+#                 </div>
+#             </div>
+#             """, unsafe_allow_html=True)
+#         else:
+#             for card in list(st.session_state.workspace_cards):
+#                 card_id   = card["id"]
+#                 collapsed = card.get("collapsed", False)
+#                 ago       = time_ago(card["time"])
+
+#                 st.markdown(f"""
+#                 <div class="study-card {card['color']}">
+#                     <div class="study-card-header">
+#                         <div class="study-card-left">
+#                             <div>
+#                                 <div class="study-card-title">{card['title']}</div>
+#                                 <div class="study-card-time">Generated {ago}</div>
+#                             </div>
+#                         </div>
+#                     </div>
+#                     <div class="study-card-divider"></div>
+#                 </div>
+#                 """, unsafe_allow_html=True)
+
+#                 if st.session_state.get(f"copied_{card_id}"):
+#                     st.markdown('<div class="copy-toast">✅ Copied Successfully</div>', unsafe_allow_html=True)
+#                     if time.time() - st.session_state.get(f"copied_at_{card_id}", 0) > 2:
+#                         del st.session_state[f"copied_{card_id}"]
+
+#                 b1, b2, b3 = st.columns([1, 1, 1])
+
+#                 with b1:
+#                     label = "▶ Expand" if collapsed else "▼ Collapse"
+#                     if st.button(label, key=f"col_{card_id}", use_container_width=True):
+#                         for c in st.session_state.workspace_cards:
+#                             if c["id"] == card_id:
+#                                 c["collapsed"] = not c["collapsed"]
+#                         st.rerun()
+
+#                 with b2:
+#                     if st.button("📋 Copy", key=f"copy_{card_id}", use_container_width=True):
+#                         safe_content = card["content"].replace("`", "\\`")
+#                         copy_js = f"""
+#                         <script>
+#                         (function() {{
+#                             if (navigator.clipboard && window.isSecureContext) {{
+#                                 navigator.clipboard.writeText(`{safe_content}`).catch(function() {{
+#                                     fallbackCopy();
+#                                 }});
+#                             }} else {{
+#                                 fallbackCopy();
+#                             }}
+#                             function fallbackCopy() {{
+#                                 var ta = document.createElement("textarea");
+#                                 ta.value = `{safe_content}`;
+#                                 ta.style.position = "fixed";
+#                                 ta.style.left = "-9999px";
+#                                 document.body.appendChild(ta);
+#                                 ta.focus();
+#                                 ta.select();
+#                                 document.execCommand("copy");
+#                                 document.body.removeChild(ta);
+#                             }}
+#                         }})();
+#                         </script>
+#                         """
+#                         components.html(copy_js, height=0)
+#                         st.session_state[f"copied_{card_id}"]    = True
+#                         st.session_state[f"copied_at_{card_id}"] = time.time()
+#                         st.rerun()
+
+#                 with b3:
+#                     if st.button("🗑 Delete", key=f"del_{card_id}", use_container_width=True):
+#                         st.session_state.workspace_cards = [
+#                             c for c in st.session_state.workspace_cards
+#                             if c["id"] != card_id
+#                         ]
+#                         st.session_state.pop(f"copied_{card_id}", None)
+#                         st.session_state.pop(f"copied_at_{card_id}", None)
+#                         st.rerun()
+
+#                 if not collapsed:
+#                     st.markdown('<div class="study-card-body">', unsafe_allow_html=True)
+#                     st.markdown(card["content"])
+#                     st.markdown("</div>", unsafe_allow_html=True)
+
+#                 st.write("")
+
+
+# # ==========================================================
+# # EMPTY STATE (no file uploaded)
+# # ==========================================================
+
+# else:
+#     st.markdown("""
+#     <div style="text-align:center; padding:50px 20px; background:#131826;
+#         border:1px dashed #1E2438; border-radius:18px; margin-top:14px;">
+#         <div style="font-size:52px; margin-bottom:16px;">📘</div>
+#         <div style="font-size:20px; font-weight:700; color:#FFFFFF; margin-bottom:8px;">
+#             Upload your first notes to begin
+#         </div>
+#         <div style="font-size:14px; color:#4A5578; line-height:1.7; max-width:420px; margin:0 auto;">
+#             Drag PDFs into the upload card above.<br>
+#             The AI will read your notes and help you study smarter —<br>
+#             summaries, questions, MCQs, memory tricks and more.
+#         </div>
+#     </div>
+#     """, unsafe_allow_html=True)
+
+
+# # ==========================================================
+# # FOOTER
+# # ==========================================================
+
+# st.markdown("""
+# <div class="app-footer">
+#     📘 AI Exam Preparation Assistant &nbsp;•&nbsp; Version 1.2 &nbsp;•&nbsp; Built for Students &nbsp;•&nbsp; Day 16 / 30
+# </div>
+# """, unsafe_allow_html=True)
+
+
+# ==========================================================
+# IMPORTS
+# ==========================================================
+
+import streamlit as st
+import streamlit.components.v1 as components
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+import chromadb
+import google.generativeai as genai
+import os
+import io
+import re
+import time
+from datetime import datetime
+from dotenv import load_dotenv
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
+
+# ==========================================================
+# LOAD ENVIRONMENT VARIABLES
+# ==========================================================
+
+load_dotenv()
+
+
+# ==========================================================
+# PAGE CONFIGURATION
+# ==========================================================
+
+st.set_page_config(
+    page_title="AI Exam Preparation Assistant",
+    page_icon="📘",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+
+# ==========================================================
+# GEMINI CONFIGURATION
+# ==========================================================
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+
+
+# ==========================================================
+# LOAD EMBEDDING MODEL
+# ==========================================================
+
+@st.cache_resource
+def load_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+model = load_model()
+
+
+# ==========================================================
+# SESSION STATE
+# ==========================================================
+
+default_states = {
+    "documents":        {},
+    "collection_ready": False,
+    "ai_responses":     0,
+    "searches_done":    0,
+    "summaries_done":   0,
+    "search_scope":     "All Notes",
+    "pending_delete":   None,
+    "workspace_cards":  [],
+    "focus_section":    None,
+    "duplicate_notice": None,
+}
+
+for key, value in default_states.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ==========================================================
+# HELPER FUNCTIONS
+# ==========================================================
+
+def chunk_text(text, chunk_size=1000):
+    chunks = []
+    for i in range(0, len(text), chunk_size):
+        chunks.append(text[i:i + chunk_size])
+    return chunks
+
+
+@st.cache_data
+def process_pdf(file_bytes, file_name):
+    import io as _io
+    reader = PdfReader(_io.BytesIO(file_bytes))
+    text = ""
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted
+    chunks = chunk_text(text)
+    return chunks, len(reader.pages)
+
+
+@st.cache_data
+def generate_embeddings(chunks_tuple):
+    chunks = list(chunks_tuple)
+    embeddings = model.encode(chunks)
+    return embeddings
+
+
+def time_ago(timestamp_str):
+    if not timestamp_str:
+        return ""
+    try:
+        then = datetime.strptime(timestamp_str, "%H:%M")
+        now  = datetime.now()
+        diff = (now.hour * 60 + now.minute) - (then.hour * 60 + then.minute)
+        if diff <= 0:
+            return "just now"
+        if diff == 1:
+            return "1 min ago"
+        return f"{diff} min ago"
+    except Exception:
+        return ""
+
+
+def add_workspace_card(card_type, title, content, color):
+    card_id = f"{card_type}_{int(time.time()*1000)}"
+    st.session_state.workspace_cards.append({
+        "id":        card_id,
+        "type":      card_type,
+        "title":     title,
+        "content":   content,
+        "color":     color,
+        "time":      datetime.now().strftime("%H:%M"),
+        "collapsed": False,
+    })
+    st.session_state.ai_responses += 1
+
+
+def show_error(error_type):
+    messages = {
+        "api_quota":      "⚠️ Gemini API quota exceeded. Please wait a few minutes and try again.",
+        "api_key":        "🔑 Invalid or missing API key. Please check your .env file.",
+        "no_answer":      "🔍 No relevant answer found in the uploaded notes.",
+        "empty_question": "✏️ Please enter a question before searching.",
+        "no_docs":        "📂 Please upload at least one PDF before using this feature.",
+        "general":        "❌ Something went wrong. Please try again.",
+    }
+    st.error(messages.get(error_type, messages["general"]))
+
+
+def handle_gemini_error(e):
+    err = str(e).lower()
+    if "quota" in err or "429" in err or "rate" in err:
+        show_error("api_quota")
+    elif "api_key" in err or "credential" in err or "401" in err:
+        show_error("api_key")
+    else:
+        st.error(f"❌ Unexpected error: {e}")
+
+
+def get_active_chunks():
+    if st.session_state.search_scope == "All Notes":
+        return {name: data["chunks"] for name, data in st.session_state.documents.items()}
+    else:
+        name = st.session_state.search_scope
+        if name in st.session_state.documents:
+            return {name: st.session_state.documents[name]["chunks"]}
+        return {}
+
+
+def delete_document(fname):
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(name="notes")
+    existing = collection.get(where={"source": fname})
+    if existing["ids"]:
+        collection.delete(ids=existing["ids"])
+    if fname in st.session_state.documents:
+        del st.session_state.documents[fname]
+    process_pdf.clear()
+    generate_embeddings.clear()
+    if st.session_state.search_scope == fname:
+        st.session_state.search_scope = "All Notes"
+    st.session_state.pop("pdf_uploader", None)
+    if len(st.session_state.documents) == 0:
+        st.session_state.collection_ready = False
+
+
+# ==========================================================
+# PDF EXPORT FUNCTIONS  (Day 17)
+# ==========================================================
+
+def _clean_inline(text):
+    """Escape XML special chars then convert inline markdown to ReportLab tags."""
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'\*(.+?)\*',     r'<i>\1</i>', text)
+    text = re.sub(r'`(.+?)`',       r'\1',         text)
+    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1',      text)
+    return text.strip()
+
+
+def _get_styles():
+    """Return themed ReportLab ParagraphStyles."""
+    base = getSampleStyleSheet()
+
+    return {
+        "app_title": ParagraphStyle(
+            "AppTitle",
+            parent=base["Normal"],
+            fontSize=16, leading=22, fontName="Helvetica-Bold",
+            textColor=colors.HexColor("#1246CC"),
+            spaceAfter=2, alignment=TA_LEFT,
+        ),
+        "card_title": ParagraphStyle(
+            "CardTitle",
+            parent=base["Normal"],
+            fontSize=13, leading=18, fontName="Helvetica-Bold",
+            textColor=colors.HexColor("#1E3A5F"),
+            spaceBefore=6, spaceAfter=3, alignment=TA_LEFT,
+        ),
+        "meta": ParagraphStyle(
+            "Meta",
+            parent=base["Normal"],
+            fontSize=9, leading=13, fontName="Helvetica",
+            textColor=colors.HexColor("#6B7280"),
+            spaceAfter=2,
+        ),
+        "section": ParagraphStyle(
+            "Section",
+            parent=base["Normal"],
+            fontSize=12, leading=17, fontName="Helvetica-Bold",
+            textColor=colors.HexColor("#1E3A5F"),
+            spaceBefore=8, spaceAfter=3,
+        ),
+        "heading": ParagraphStyle(
+            "Heading",
+            parent=base["Normal"],
+            fontSize=11, leading=15, fontName="Helvetica-Bold",
+            textColor=colors.HexColor("#1F2937"),
+            spaceBefore=5, spaceAfter=2,
+        ),
+        "body": ParagraphStyle(
+            "Body",
+            parent=base["Normal"],
+            fontSize=10, leading=15, fontName="Helvetica",
+            textColor=colors.HexColor("#1F2937"),
+            spaceAfter=3, wordWrap="CJK",
+        ),
+        "bullet": ParagraphStyle(
+            "Bullet",
+            parent=base["Normal"],
+            fontSize=10, leading=15, fontName="Helvetica",
+            textColor=colors.HexColor("#1F2937"),
+            leftIndent=16, bulletIndent=6,
+            spaceAfter=2, wordWrap="CJK",
+        ),
+        "footer": ParagraphStyle(
+            "Footer",
+            parent=base["Normal"],
+            fontSize=8, leading=11, fontName="Helvetica-Oblique",
+            textColor=colors.HexColor("#9CA3AF"),
+            alignment=TA_CENTER,
+        ),
+    }
+
+
+def _markdown_to_flowables(text, styles):
+    """Convert markdown text to a list of ReportLab Flowables."""
+    flowables = []
+    for line in text.split("\n"):
+
+        # Heading (## / ###)
+        h = re.match(r'^(#{1,6})\s+(.*)', line)
+        if h:
+            level = len(h.group(1))
+            t = _clean_inline(h.group(2))
+            flowables.append(Paragraph(t, styles["section"] if level <= 2 else styles["heading"]))
+            continue
+
+        # Horizontal rule
+        if re.match(r'^[-=]{3,}$', line.strip()):
+            flowables.append(Spacer(1, 2*mm))
+            flowables.append(HRFlowable(width="100%", thickness=0.5,
+                                        color=colors.HexColor("#CBD5E1")))
+            flowables.append(Spacer(1, 2*mm))
+            continue
+
+        # Bullet (- / * / •)
+        b = re.match(r'^[\*\-•]\s+(.*)', line)
+        if b:
+            flowables.append(Paragraph(f"• {_clean_inline(b.group(1))}", styles["bullet"]))
+            continue
+
+        # Numbered list
+        n = re.match(r'^(\d+)\.\s+(.*)', line)
+        if n:
+            flowables.append(Paragraph(f"{n.group(1)}. {_clean_inline(n.group(2))}", styles["bullet"]))
+            continue
+
+        # Blank line
+        if line.strip() == "":
+            flowables.append(Spacer(1, 3*mm))
+            continue
+
+        # Plain paragraph
+        clean = _clean_inline(line)
+        if clean:
+            flowables.append(Paragraph(clean, styles["body"]))
+
+    return flowables
+
+
+def _build_header(styles, card_title, scope, generated_time):
+    """Return the common PDF header flowables."""
+    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+    items = [
+        Paragraph("AI Exam Preparation Assistant", styles["app_title"]),
+        Paragraph(card_title, styles["card_title"]),
+        Paragraph(f"Generated: {generated_time}  |  Exported: {today}", styles["meta"]),
+        Paragraph(f"Source: {scope}", styles["meta"]),
+        Spacer(1, 4*mm),
+        HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2D74DA")),
+        Spacer(1, 5*mm),
+    ]
+    return items
+
+
+def _build_footer(styles):
+    """Return the common PDF footer flowables."""
+    return [
+        Spacer(1, 8*mm),
+        HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CBD5E1")),
+        Spacer(1, 2*mm),
+        Paragraph("Generated by AI Exam Preparation Assistant", styles["footer"]),
+    ]
+
+
+def build_pdf_single(card, scope):
+    """
+    Build and return a BytesIO PDF containing only this one card.
+    Never calls Gemini. Uses card['content'] from session state.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=20*mm, rightMargin=20*mm,
+        topMargin=20*mm,  bottomMargin=20*mm,
+        title=card["title"],
+    )
+    styles = _get_styles()
+    story  = []
+    story += _build_header(styles, card["title"], scope, card["time"])
+    story += _markdown_to_flowables(card["content"], styles)
+    story += _build_footer(styles)
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+def build_pdf_all(cards, scope):
+    """
+    Build and return a BytesIO PDF containing ALL visible cards in order.
+    Never calls Gemini. Uses only session state data.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=20*mm, rightMargin=20*mm,
+        topMargin=20*mm,  bottomMargin=20*mm,
+        title="AI Exam Preparation Assistant — Full Export",
+    )
+    styles = _get_styles()
+    today  = datetime.now().strftime("%Y-%m-%d %H:%M")
+    story  = []
+
+    # Cover header
+    story.append(Paragraph("AI Exam Preparation Assistant", styles["app_title"]))
+    story.append(Paragraph("Full Study Export", styles["card_title"]))
+    story.append(Paragraph(f"Exported: {today}  |  Source: {scope}", styles["meta"]))
+    story.append(Spacer(1, 4*mm))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2D74DA")))
+    story.append(Spacer(1, 6*mm))
+
+    for i, card in enumerate(cards):
+        if i > 0:
+            story.append(Spacer(1, 6*mm))
+            story.append(HRFlowable(width="100%", thickness=1,
+                                    color=colors.HexColor("#94A3B8")))
+            story.append(Spacer(1, 4*mm))
+
+        story.append(Paragraph(card["title"], styles["section"]))
+        story.append(Paragraph(f"Generated: {card['time']}", styles["meta"]))
+        story.append(Spacer(1, 3*mm))
+        story += _markdown_to_flowables(card["content"], styles)
+
+    story += _build_footer(styles)
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+def safe_filename(title):
+    """Convert card title to a safe filename stem."""
+    stem = re.sub(r'[^\w\s-]', '', title).strip()
+    stem = re.sub(r'\s+', '_', stem)
+    return stem or "export"
+
+
+# ==========================================================
+# CUSTOM CSS  (unchanged)
+# ==========================================================
+
+st.markdown("""
+<style>
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+* { font-family: 'Inter', 'Segoe UI', sans-serif; box-sizing: border-box; }
+
+.stApp { background: #0B0E18; }
+
+section[data-testid="stSidebar"] {
+    background: #10141F;
+    border-right: 1px solid #1E2438;
+    width: 240px !important;
+}
+section[data-testid="stSidebar"] * { color: #8A94A8 !important; }
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 { color: #FFFFFF !important; font-weight: 700; }
+section[data-testid="stSidebar"] hr { border-color: #1E2438 !important; margin: 10px 0; }
+section[data-testid="stSidebar"] .stAlert {
+    background: #161B2C !important;
+    border: 1px solid #1E2438 !important;
+    border-radius: 10px;
+}
+section[data-testid="stSidebar"] .stButton > button {
+    background: transparent !important;
+    border: none !important;
+    color: #8A94A8 !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    padding: 8px 10px !important;
+    height: auto !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    border-radius: 8px !important;
+    box-shadow: none !important;
+}
+section[data-testid="stSidebar"] .stButton > button:hover {
+    background: rgba(45,116,218,0.12) !important;
+    color: #5B9BF8 !important;
+    transform: none !important;
+}
+
+.block-container { padding: 1.2rem 2rem 2rem 2rem; max-width: 1400px; }
+.stApp, .stApp p, .stApp label { color: #CBD5E1; }
+
+.app-header {
+    background: linear-gradient(130deg, #1246CC 0%, #2D74DA 55%, #5B9BF8 100%);
+    padding: 28px 40px;
+    border-radius: 18px;
+    margin-bottom: 14px;
+    box-shadow: 0 6px 40px rgba(18,70,204,0.4);
+    position: relative;
+    overflow: hidden;
+}
+.app-header::after {
+    content: '📘';
+    position: absolute;
+    right: 40px; top: 50%;
+    transform: translateY(-50%);
+    font-size: 72px;
+    opacity: 0.12;
+}
+.app-header-greeting {
+    font-size: 13px; font-weight: 600; color: #A8C8FF;
+    letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 4px;
+}
+.app-header h1 {
+    margin: 0 0 6px 0; font-size: 28px; font-weight: 800;
+    color: #FFFFFF; letter-spacing: -0.5px;
+}
+.app-header p { margin: 0; font-size: 15px; color: #C8DEFF; max-width: 560px; line-height: 1.55; }
+
+.card {
+    background: #131826; border: 1px solid #1E2438;
+    border-radius: 16px; padding: 22px; height: 100%;
+}
+.card-title {
+    font-size: 15px; font-weight: 700; color: #FFFFFF;
+    margin-bottom: 16px; letter-spacing: -0.1px;
+}
+
+.empty-state { text-align: center; padding: 28px 16px; color: #3A4560; }
+.empty-state-icon { font-size: 36px; margin-bottom: 10px; }
+.empty-state-text { font-size: 13px; color: #4A5578; line-height: 1.5; }
+
+.note-item {
+    background: #0A1F14; border: 1px solid #1A5C38;
+    border-radius: 12px; padding: 12px 14px; margin-bottom: 8px;
+}
+.note-item-name {
+    font-size: 13px; font-weight: 600; color: #4ADE80; margin-bottom: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.note-item-meta { font-size: 11px; color: #5A7A60; }
+
+.compact-notice {
+    background: #161B2C; border: 1px solid #2A3555;
+    border-radius: 8px; padding: 6px 12px;
+    font-size: 12px; color: #7B88A0; margin-top: 6px;
+}
+
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.stat-box {
+    background: #0B0E18; border: 1px solid #1E2438;
+    border-radius: 10px; padding: 12px 10px; text-align: center; transition: border-color 0.2s;
+}
+.stat-box:hover { border-color: #2D74DA; }
+.stat-val { font-size: 22px; font-weight: 700; color: #4F8EF7; line-height: 1; }
+.stat-lbl { font-size: 11px; color: #5A6880; margin-top: 3px; font-weight: 500; }
+
+.badge { display: inline-block; border-radius: 20px; padding: 2px 10px; font-size: 11px; font-weight: 600; }
+.badge-ready  { background:#0A1F14; color:#4ADE80; border:1px solid #1A5C38; }
+.badge-waiting{ background:#1A140A; color:#FBBF24; border:1px solid #5C4010; }
+
+.section-heading {
+    font-size: 19px; font-weight: 700; color: #FFFFFF;
+    margin: 14px 0 10px 0; letter-spacing: -0.3px;
+    display: flex; align-items: center; gap: 8px;
+}
+
+.ask-bar-card {
+    background: #131826; border: 1px solid #1E2438;
+    border-radius: 16px; padding: 22px; margin-bottom: 16px;
+}
+
+.tool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.tool-card {
+    background: #131826; border: 1px solid #1E2438;
+    border-radius: 14px; padding: 18px 16px;
+    transition: border-color 0.2s, background 0.2s; cursor: pointer;
+}
+.tool-card:hover { border-color: #2D74DA; background: #161D30; }
+.tool-card-icon  { font-size: 22px; margin-bottom: 8px; }
+.tool-card-title { font-size: 14px; font-weight: 700; color: #FFFFFF; margin-bottom: 3px; }
+.tool-card-desc  { font-size: 12px; color: #5A6880; line-height: 1.4; }
+
+.stButton > button {
+    width: 100%; height: 44px; border-radius: 10px;
+    background: #1A56DB; color: #FFFFFF !important;
+    font-size: 14px; font-weight: 600; border: none;
+    transition: background 0.2s, transform 0.1s;
+}
+.stButton > button:hover { background: #1446BF; transform: translateY(-1px); }
+.stButton > button:active { transform: translateY(0); }
+
+.clear-all-btn > button {
+    background: transparent !important; border: 1px solid #2A1A1A !important;
+    color: #F87171 !important; height: 36px !important; font-size: 13px !important;
+}
+.clear-all-btn > button:hover { background: #1A0A0A !important; }
+
+.delete-note-btn > button {
+    background: transparent !important; border: 1px solid #2A1A1A !important;
+    color: #F87171 !important; height: 32px !important; font-size: 12px !important;
+}
+.delete-note-btn > button:hover { background: #1A0A0A !important; }
+
+/* Download button — subtle, consistent with dark theme */
+.stDownloadButton > button {
+    width: 100%; height: 44px; border-radius: 10px;
+    background: #1E2438 !important; color: #A0AABB !important;
+    font-size: 14px !important; font-weight: 600 !important;
+    border: 1px solid #2A3555 !important;
+    transition: background 0.2s, color 0.2s !important;
+}
+.stDownloadButton > button:hover {
+    background: #2A3555 !important; color: #E2E8F0 !important;
+    transform: translateY(-1px) !important;
+}
+.stDownloadButton > button:active { transform: translateY(0) !important; }
+
+.stTextInput > div > div > input {
+    border-radius: 10px; background: #0B0E18 !important;
+    border: 1px solid #1E2438 !important; color: #E2E8F0 !important;
+    font-size: 15px; padding: 10px 14px;
+}
+.stTextInput > div > div > input::placeholder { color: #3A4560 !important; }
+.stTextInput > div > div > input:focus {
+    border-color: #2D74DA !important;
+    box-shadow: 0 0 0 2px rgba(45,116,218,0.2) !important;
+}
+
+.stSelectbox > div > div {
+    background: #0B0E18 !important; border: 1px solid #1E2438 !important;
+    border-radius: 10px !important; color: #E2E8F0 !important;
+}
+
+[data-testid="stFileUploader"] {
+    background: #0B0E18; border: 2px dashed #1E2438;
+    border-radius: 12px; padding: 6px; transition: border-color 0.2s;
+}
+[data-testid="stFileUploader"]:hover { border-color: #2D74DA; }
+[data-testid="stFileUploader"] * { color: #4A5578 !important; }
+
+.workspace-title { font-size: 17px; font-weight: 700; color: #FFFFFF; }
+.workspace-sub   { font-size: 12px; color: #4A5578; margin-top: 2px; }
+
+.study-card {
+    border-radius: 14px;
+    border-left-width: 3px; border-left-style: solid;
+    border-top: 1px solid #1E2438; border-right: 1px solid #1E2438;
+    border-bottom: 1px solid #1E2438;
+    background: #131826; margin-bottom: 14px; overflow: hidden;
+}
+.study-card-header {
+    display: flex; align-items: center;
+    justify-content: space-between; padding: 14px 18px;
+}
+.study-card-left { display: flex; align-items: center; gap: 10px; }
+.study-card-title{ font-size: 14px; font-weight: 700; color: #FFFFFF; }
+.study-card-time { font-size: 11px; color: #3A4560; margin-top: 2px; }
+.study-card-body { padding: 0 18px 18px 18px; color: #C9D1E0; font-size: 14px; line-height: 1.7; }
+.study-card-divider { height: 1px; background: #1E2438; margin: 0 18px; }
+
+.card-answer       { border-left-color: #2D74DA; }
+.card-summary      { border-left-color: #10B981; }
+.card-questions    { border-left-color: #F59E0B; }
+.card-mcqs         { border-left-color: #8B5CF6; }
+.card-memorytricks { border-left-color: #F43F5E; }
+
+.copy-toast {
+    background: #0A1F14; border: 1px solid #1A5C38; color: #4ADE80;
+    border-radius: 8px; padding: 6px 12px; font-size: 12px;
+    text-align: center; margin-bottom: 8px;
+}
+
+.nav-section {
+    font-size: 10px; font-weight: 700; color: #2A3555 !important;
+    letter-spacing: 1.2px; text-transform: uppercase; padding: 6px 0 4px 0;
+}
+.nav-item {
+    padding: 8px 10px; border-radius: 8px; margin-bottom: 2px;
+    font-size: 13px; font-weight: 500; color: #8A94A8 !important;
+    display: flex; align-items: center; gap: 8px;
+}
+.nav-active {
+    background: rgba(45,116,218,0.15) !important;
+    color: #5B9BF8 !important;
+    border-left: 2px solid #2D74DA; padding-left: 8px;
+}
+.nav-disabled { color: #2A3555 !important; cursor: not-allowed; }
+.soon-badge {
+    font-size: 9px; background: #161B2C; color: #3A4560 !important;
+    border: 1px solid #1E2438; border-radius: 20px;
+    padding: 1px 6px; margin-left: auto;
+}
+.version-box {
+    background: #0B0E18; border: 1px solid #1E2438;
+    border-radius: 10px; padding: 12px 14px; margin-top: 6px;
+}
+.version-row { display: flex; justify-content: space-between; font-size: 11px; color: #3A4560; margin-bottom: 3px; }
+.version-val { color: #6A7A98 !important; }
+
+[data-testid="stExpander"] {
+    background: #131826 !important; border: 1px solid #1E2438 !important; border-radius: 10px !important;
+}
+.streamlit-expanderHeader { color: #CBD5E1 !important; background: #131826 !important; }
+
+[data-testid="metric-container"] {
+    background: #0B0E18; border-radius: 10px; padding: 12px; border: 1px solid #1E2438;
+}
+[data-testid="metric-container"] label { color: #4A5578 !important; font-size: 12px; }
+[data-testid="stMetricValue"] { color: #4F8EF7 !important; font-weight: 700; }
+
+.stSpinner > div { border-top-color: #2D74DA !important; }
+hr { border-color: #1E2438 !important; margin: 12px 0; }
+h2, h3 { color: #FFFFFF !important; }
+.stAlert { border-radius: 10px; }
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: #0B0E18; }
+::-webkit-scrollbar-thumb { background: #1E2438; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #2A3450; }
+
+.app-footer {
+    text-align: center; padding: 16px 0 8px 0;
+    border-top: 1px solid #1E2438; margin-top: 16px;
+    font-size: 12px; color: #2A3555;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# ==========================================================
+# SIDEBAR
+# ==========================================================
+
+with st.sidebar:
+    st.markdown("## 📘 Exam Assistant")
+    st.caption("Your personal study companion")
+    st.divider()
+
+    st.markdown('<div class="nav-section">Notes</div>', unsafe_allow_html=True)
+    st.markdown('<div class="nav-item nav-active">📂 Upload Notes</div>', unsafe_allow_html=True)
+    st.markdown('<div class="nav-item nav-disabled">📚 Notes Library <span class="soon-badge">Soon</span></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="nav-section" style="margin-top:8px">Study Tools</div>', unsafe_allow_html=True)
+
+    if st.button("❓ Ask Questions",   key="nav_ask",           use_container_width=True):
+        st.session_state.focus_section = "ask";          st.rerun()
+    if st.button("📝 Summary",          key="nav_summary",       use_container_width=True):
+        st.session_state.focus_section = "summary";      st.rerun()
+    if st.button("🎯 MCQs",             key="nav_mcqs",          use_container_width=True):
+        st.session_state.focus_section = "mcqs";         st.rerun()
+    if st.button("🧠 Memory Tricks",    key="nav_memory_tricks", use_container_width=True):
+        st.session_state.focus_section = "memory_tricks"; st.rerun()
+
+    st.markdown('<div class="nav-item nav-disabled">📅 Study Planner <span class="soon-badge">Soon</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="nav-item nav-disabled">🗺️ Mind Map <span class="soon-badge">Soon</span></div>',      unsafe_allow_html=True)
+
+    st.markdown('<div class="nav-section" style="margin-top:8px">Activity</div>', unsafe_allow_html=True)
+
+    if st.button("🕐 History",  key="nav_history",  use_container_width=True):
+        st.session_state.focus_section = "history";  st.rerun()
+    if st.button("⚙️ Settings", key="nav_settings", use_container_width=True):
+        st.session_state.focus_section = "settings"; st.rerun()
+
+    st.divider()
+    st.markdown("### Project Info")
+    st.markdown("""
+    <div class="version-box">
+        <div class="version-row">Version  <span class="version-val">1.3.0</span></div>
+        <div class="version-row">Day      <span class="version-val">17 / 30</span></div>
+        <div class="version-row">Status   <span style="color:#4ADE80 !important">● Active</span></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.write("")
+    st.info("Upload your notes and let AI help you study smarter.")
+
+
+# ==========================================================
+# HEADER
+# ==========================================================
+
+hour = datetime.now().hour
+greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 17 else "Good evening")
+
+st.markdown(f"""
+<div class="app-header">
+    <div class="app-header-greeting">{greeting}, Student</div>
+    <h1>Ready to Study?</h1>
+    <p>Upload your notes, ask questions, generate summaries, practice questions and MCQs — all powered by AI.</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ==========================================================
+# TOP CARDS ROW
+# ==========================================================
+
+col_upload, col_recent, col_stats = st.columns([1.4, 1.3, 1])
+
+with col_upload:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">📂 Upload Notes</div>', unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader(
+        "Upload PDFs", type=["pdf"],
+        label_visibility="collapsed",
+        accept_multiple_files=True,
+        key="pdf_uploader"
+    )
+
+    if not uploaded_files:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="empty-state-icon">📄</div>
+            <div class="empty-state-text">Drag your PDFs here<br>or click Browse Files<br><br>Supported: PDF &nbsp;•&nbsp; Max 200 MB each</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if st.session_state.duplicate_notice:
+        st.markdown(
+            f'<div class="compact-notice">ℹ️ {st.session_state.duplicate_notice} already exists</div>',
+            unsafe_allow_html=True
+        )
+        st.session_state.duplicate_notice = None
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_recent:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">📄 Uploaded Notes</div>', unsafe_allow_html=True)
+
+    if st.session_state.documents:
+        for fname, data in list(st.session_state.documents.items()):
+            if st.session_state.pending_delete == fname:
+                st.markdown(f"""
+                <div class="note-item" style="border-color:#5C2626; background:#1A0A0A;">
+                    <div class="note-item-name" style="color:#F87171;">⚠️ Delete {fname}?</div>
+                    <div class="note-item-meta">This will remove the file and its study material.</div>
+                </div>
+                """, unsafe_allow_html=True)
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    if st.button("✅ Yes, Delete", key=f"confirm_{fname}", use_container_width=True):
+                        delete_document(fname)
+                        st.session_state.pending_delete = None
+                        st.rerun()
+                with dc2:
+                    if st.button("✖ Cancel", key=f"cancel_{fname}", use_container_width=True):
+                        st.session_state.pending_delete = None
+                        st.rerun()
+            else:
+                nc1, nc2 = st.columns([4, 1])
+                with nc1:
+                    st.markdown(f"""
+                    <div class="note-item">
+                        <div class="note-item-name" title="{fname}">✅ {fname}</div>
+                        <div class="note-item-meta">{data['pages']} pages &nbsp;•&nbsp; {data['file_size']} KB &nbsp;•&nbsp; {time_ago(data['upload_time'])}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with nc2:
+                    st.markdown('<div class="delete-note-btn">', unsafe_allow_html=True)
+                    if st.button("🗑", key=f"delnote_{fname}", use_container_width=True):
+                        st.session_state.pending_delete = fname
+                        st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="empty-state-icon">📭</div>
+            <div class="empty-state-text">No notes uploaded yet.<br>Upload your first PDF to begin studying.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_stats:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">📊 Statistics</div>', unsafe_allow_html=True)
+
+    db_badge = (
+        '<span class="badge badge-ready">● Ready</span>'
+        if st.session_state.collection_ready
+        else '<span class="badge badge-waiting">○ Waiting</span>'
+    )
+    total_pages = sum(d["pages"] for d in st.session_state.documents.values())
+
+    st.markdown(f"""
+    <div class="stat-grid">
+        <div class="stat-box"><div class="stat-val">{len(st.session_state.documents)}</div><div class="stat-lbl">Notes</div></div>
+        <div class="stat-box"><div class="stat-val">{total_pages}</div><div class="stat-lbl">Pages</div></div>
+        <div class="stat-box"><div class="stat-val">{st.session_state.searches_done}</div><div class="stat-lbl">AI Searches</div></div>
+        <div class="stat-box"><div class="stat-val">{st.session_state.summaries_done}</div><div class="stat-lbl">Summaries</div></div>
+    </div>
+    <div style="text-align:center; margin-top:8px; font-size:12px; color:#4A5578;">Study Material &nbsp;{db_badge}</div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ==========================================================
+# PDF PROCESSING
+# ==========================================================
+
+if uploaded_files:
+    client     = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(name="notes")
+    new_files_processed = False
+
+    for uploaded_file in uploaded_files:
+        if uploaded_file.name in st.session_state.documents:
+            st.session_state.duplicate_notice = uploaded_file.name
+            continue
+
+        file_bytes   = uploaded_file.read()
+        file_size_kb = round(len(file_bytes) / 1024, 1)
+
+        with st.status(f"⚙️ Preparing {uploaded_file.name}...", expanded=True) as status:
+            st.write("📖 Reading PDF...")
+            chunks, num_pages = process_pdf(file_bytes, uploaded_file.name)
+            st.write("🧮 Processing content...")
+            embeddings = generate_embeddings(tuple(chunks))
+            st.write("🗄️ Adding to search index...")
+            collection.add(
+                documents=chunks,
+                embeddings=embeddings.tolist(),
+                metadatas=[{"source": uploaded_file.name} for _ in chunks],
+                ids=[f"{uploaded_file.name}_{i}" for i in range(len(chunks))]
+            )
+            st.session_state.documents[uploaded_file.name] = {
+                "chunks":        chunks,
+                "pages":         num_pages,
+                "file_size":     file_size_kb,
+                "upload_time":   datetime.now().strftime("%H:%M"),
+                "embedding_dim": len(embeddings[0]),
+            }
+            st.session_state.collection_ready = True
+            new_files_processed = True
+            status.update(label=f"✅ {uploaded_file.name} ready!", state="complete", expanded=False)
+
+    if new_files_processed:
+        st.rerun()
+
+
+# ==========================================================
+# HISTORY / SETTINGS PLACEHOLDERS
+# ==========================================================
+
+if st.session_state.focus_section == "history":
+    st.info("🕐 History page is coming soon.")
+    st.session_state.focus_section = None
+
+if st.session_state.focus_section == "settings":
+    st.info("⚙️ Settings page is coming soon.")
+    st.session_state.focus_section = None
+
+
+# ==========================================================
+# MAIN WORKSPACE
+# ==========================================================
+
+if st.session_state.documents:
+
+    st.markdown('<div class="section-heading">⚙️ Study Workspace</div>', unsafe_allow_html=True)
+
+    left_panel, right_panel = st.columns([0.62, 1.0])
+
+    # ── LEFT PANEL ──
+    with left_panel:
+
+        if st.session_state.focus_section in ("ask", "summary", "mcqs", "memory_tricks"):
+            labels = {
+                "ask":           "👆 Ask Questions",
+                "summary":       "👆 Summary",
+                "mcqs":          "👆 MCQs",
+                "memory_tricks": "👆 Memory Tricks",
+            }
+            st.markdown(
+                f'<div style="color:#4F8EF7;font-size:12px;margin-bottom:4px;">'
+                f'{labels[st.session_state.focus_section]}</div>',
+                unsafe_allow_html=True
+            )
+            st.session_state.focus_section = None
+
+        st.markdown('<div class="ask-bar-card">', unsafe_allow_html=True)
+        st.markdown('<div class="card-title">💬 Ask a Question</div>', unsafe_allow_html=True)
+
+        scope_options = ["All Notes"] + list(st.session_state.documents.keys())
+        if st.session_state.search_scope not in scope_options:
+            st.session_state.search_scope = "All Notes"
+
+        st.session_state.search_scope = st.selectbox(
+            "Search In", options=scope_options,
+            index=scope_options.index(st.session_state.search_scope)
+        )
+
+        question     = st.text_input("", placeholder="Ask anything from your uploaded notes...", key="question_input")
+        search_clicked = st.button("🔍 Search Notes", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="tool-grid">
+            <div class="tool-card"><div class="tool-card-icon">📝</div><div class="tool-card-title">Study Summary</div><div class="tool-card-desc">Key concepts from your notes</div></div>
+            <div class="tool-card"><div class="tool-card-icon">❓</div><div class="tool-card-title">Practice Questions</div><div class="tool-card-desc">Short & long answer questions</div></div>
+            <div class="tool-card"><div class="tool-card-icon">🎯</div><div class="tool-card-title">MCQ Practice</div><div class="tool-card-desc">10 multiple choice questions</div></div>
+            <div class="tool-card"><div class="tool-card-icon">🧠</div><div class="tool-card-title">Memory Tricks</div><div class="tool-card-desc">Mnemonics & exam shortcuts</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        t1, t2 = st.columns(2)
+        with t1:
+            summary_clicked   = st.button("📝 Generate Summary",   use_container_width=True)
+        with t2:
+            questions_clicked = st.button("❓ Practice Questions", use_container_width=True)
+
+        t3, t4 = st.columns(2)
+        with t3:
+            mcq_clicked           = st.button("🎯 Generate MCQs",       use_container_width=True)
+        with t4:
+            memory_tricks_clicked = st.button("🧠 Memory Tricks",        use_container_width=True)
+
+
+    # ── RIGHT PANEL ──
+    with right_panel:
+
+        # ── Workspace toolbar: title | Export All | Clear All ──
+        ws_c1, ws_c2, ws_c3 = st.columns([2, 1, 0.7])
+
+        with ws_c1:
+            st.markdown("""
+            <div class="workspace-title">🗂️ Study Workspace</div>
+            <div class="workspace-sub">Generated study material appears here as cards.</div>
+            """, unsafe_allow_html=True)
+
+        with ws_c2:
+            # ── Export All (PDF) — Day 17 Feature 3 ──
+            if st.session_state.workspace_cards:
+                today_str   = datetime.now().strftime("%Y-%m-%d")
+                all_pdf_buf = build_pdf_all(
+                    st.session_state.workspace_cards,
+                    st.session_state.search_scope
+                )
+                st.download_button(
+                    label="📦 Export All (PDF)",
+                    data=all_pdf_buf,
+                    file_name=f"Export_All_{today_str}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="export_all_pdf"
+                )
+            else:
+                st.button(
+                    "📦 Export All (PDF)",
+                    disabled=True,
+                    use_container_width=True,
+                    key="export_all_disabled",
+                    help="Generate at least one response before exporting."
+                )
+
+        with ws_c3:
+            st.markdown('<div class="clear-all-btn">', unsafe_allow_html=True)
+            if st.button("🗑️ Clear All", use_container_width=True):
+                st.session_state.workspace_cards = []
+                st.session_state.searches_done   = 0
+                st.session_state.summaries_done  = 0
+                st.session_state.ai_responses    = 0
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # ── Search ──
+        if search_clicked:
+            if not question.strip():
+                show_error("empty_question")
+            else:
+                client     = chromadb.PersistentClient(path="./chroma_db")
+                collection = client.get_or_create_collection(name="notes")
+
+                query_filter = None
+                if st.session_state.search_scope != "All Notes":
+                    query_filter = {"source": st.session_state.search_scope}
+
+                with st.spinner("🔍 Searching your notes..."):
+                    query_embedding = model.encode(question)
+                    results = collection.query(
+                        query_embeddings=[query_embedding.tolist()],
+                        n_results=3,
+                        include=["documents", "distances", "metadatas"],
+                        where=query_filter
+                    )
+
+                if not results["documents"][0]:
+                    show_error("no_answer")
+                else:
+                    context = "\n\n".join(results["documents"][0])
+                    prompt = f"""
+You are an expert AI Exam Preparation Assistant.
+Answer the student's question using ONLY the provided notes.
+Rules:
+- Read all retrieved notes carefully before answering.
+- The answer may require combining information from multiple sections.
+- Do not rely on exact keyword matching.
+- Infer the correct answer whenever it is clearly supported by the notes.
+- Never use outside knowledge.
+- If multiple important points exist, present them as bullet points.
+- Keep the explanation clear, structured, and exam-oriented.
+- If the notes do not contain enough information to answer confidently, reply exactly:
+"The answer is not available in the uploaded notes."
+
+Retrieved Notes:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+                    try:
+                        with st.spinner("🤖 Generating answer..."):
+                            response = gemini_model.generate_content(prompt)
+
+                        answer_text = response.text + "\n\n---\n**Sources:**\n"
+                        for i, (doc, dist, meta) in enumerate(zip(
+                            results["documents"][0],
+                            results["distances"][0],
+                            results["metadatas"][0]
+                        )):
+                            confidence  = "High" if dist < 0.5 else ("Medium" if dist < 1.0 else "Low")
+                            source_name = meta.get("source", "Unknown")
+                            answer_text += f"\n**Source {i+1}** — {source_name} — Confidence: {confidence}\n> {doc[:200]}...\n"
+
+                        add_workspace_card("answer", "💬 Answer", answer_text, "card-answer")
+                        st.session_state.searches_done += 1
+                        st.rerun()
+                    except Exception as e:
+                        handle_gemini_error(e)
+
+        # ── Summary ──
+        if summary_clicked:
+            active_chunks = get_active_chunks()
+            if not active_chunks:
+                show_error("no_docs")
+            else:
+                try:
+                    with st.spinner("📝 Generating study summary..."):
+                        full_summary = ""
+                        for doc_name, doc_chunks in active_chunks.items():
+                            summary_context = "\n\n".join(doc_chunks)
+                            summary_prompt = f"""
+You are an AI Exam Preparation Assistant.
+Create a concise study summary from the notes.
+Focus on: Main concepts, Important ideas, Key points, Exam-relevant information.
+
+Notes:
+{summary_context}
+
+Summary:
+"""
+                            resp = gemini_model.generate_content(summary_prompt)
+                            if len(active_chunks) > 1:
+                                full_summary += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+                            else:
+                                full_summary += resp.text
+
+                    add_workspace_card("summary", "📝 Study Summary", full_summary, "card-summary")
+                    st.session_state.summaries_done += 1
+                    st.rerun()
+                except Exception as e:
+                    handle_gemini_error(e)
+
+        # ── Questions ──
+        if questions_clicked:
+            active_chunks = get_active_chunks()
+            if not active_chunks:
+                show_error("no_docs")
+            else:
+                try:
+                    with st.spinner("❓ Generating practice questions..."):
+                        full_questions = ""
+                        for doc_name, doc_chunks in active_chunks.items():
+                            questions_context = "\n\n".join(doc_chunks)
+                            questions_prompt = f"""
+You are an AI Exam Preparation Assistant.
+Generate important exam-oriented questions from the provided notes.
+Requirements:
+- Generate exactly 5 Short Answer Questions.
+- Generate exactly 5 Long Answer Questions.
+- Do not provide answers.
+- Questions should be based only on the notes.
+- Focus on concepts important for university exams.
+
+Output Format:
+SHORT ANSWER QUESTIONS
+1. ...
+2. ...
+3. ...
+4. ...
+5. ...
+
+LONG ANSWER QUESTIONS
+1. ...
+2. ...
+3. ...
+4. ...
+5. ...
+
+Notes:
+{questions_context}
+
+Questions:
+"""
+                            resp = gemini_model.generate_content(questions_prompt)
+                            if len(active_chunks) > 1:
+                                full_questions += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+                            else:
+                                full_questions += resp.text
+
+                    add_workspace_card("questions", "❓ Practice Questions", full_questions, "card-questions")
+                    st.rerun()
+                except Exception as e:
+                    handle_gemini_error(e)
+
+        # ── MCQs ──
+        if mcq_clicked:
+            active_chunks = get_active_chunks()
+            if not active_chunks:
+                show_error("no_docs")
+            else:
+                try:
+                    with st.spinner("🎯 Generating MCQs..."):
+                        full_mcqs = ""
+                        for doc_name, doc_chunks in active_chunks.items():
+                            mcq_context = "\n\n".join(doc_chunks)
+                            mcq_prompt = f"""
+You are an AI Exam Preparation Assistant.
+Generate exactly 10 multiple-choice questions from the provided notes.
+Requirements:
+- Questions must be based only on the notes.
+- Generate exactly 10 MCQs.
+- Each question must have exactly 4 options labeled A. B. C. D.
+- Put every option on a separate line.
+- Leave one blank line after each option.
+- After options write: Answer: X
+
+Example:
+Q1. Question
+
+A. Option 1
+
+B. Option 2
+
+C. Option 3
+
+D. Option 4
+
+Answer: B
+
+Notes:
+{mcq_context}
+
+MCQs:
+"""
+                            resp = gemini_model.generate_content(mcq_prompt)
+                            if len(active_chunks) > 1:
+                                full_mcqs += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+                            else:
+                                full_mcqs += resp.text
+
+                    add_workspace_card("mcqs", "🎯 MCQ Practice", full_mcqs, "card-mcqs")
+                    st.rerun()
+                except Exception as e:
+                    handle_gemini_error(e)
+
+        # ── Memory Tricks ──
+        if memory_tricks_clicked:
+            active_chunks = get_active_chunks()
+            if not active_chunks:
+                show_error("no_docs")
+            else:
+                try:
+                    with st.spinner("🧠 Generating Memory Tricks..."):
+                        full_memory_tricks = ""
+                        for doc_name, doc_chunks in active_chunks.items():
+                            memory_context = "\n\n".join(doc_chunks)
+                            memory_prompt = f"""
+You are an expert exam mentor helping university students remember topics quickly.
+Your task is to create highly memorable Memory Tricks from the provided notes.
+The goal is NOT to summarize the chapter.
+The goal is to help students remember difficult concepts during exams.
+Generate only information that actually exists in the notes.
+If a topic does not naturally support a mnemonic, create another memory technique instead.
+
+Use the following techniques wherever appropriate:
+
+1. Acronyms
+Create memorable acronyms from important concepts.
+Example:
+SMART
+S – Smart Contracts
+M – Market Access
+A – Automation
+R – Reputation
+T – Transparency
+
+2. Mnemonics
+Example:
+Remember "SCALE"
+S → SAR
+C → CNN
+A → Adam Optimizer
+L → Lee Filter
+E → Evaluation Metrics
+
+3. Memory Sentences
+Example:
+"Smart Workers Build Trust"
+Smart → Smart Contracts
+Workers → Work Ledger
+Build → Blockchain
+Trust → Transparency
+
+4. Number Tricks
+Highlight important years, percentages and values.
+Example:
+80% → Informal Workforce
+400 Million → Workers
+455 Billion → Gig Economy
+
+5. Compare Similar Concepts
+Example:
+Blockchain
+✓ Stores work history
+✓ Cannot be changed
+Traditional Database
+✓ Centralized
+✓ Can be modified
+
+6. Exam Keywords
+List only the words students should remember.
+Example:
+Immutable Ledger
+Digital Identity
+Smart Contracts
+Portable Reputation
+Transparency
+
+7. Frequently Confused Concepts
+If two concepts are similar, explain how to differentiate them in one line.
+
+8. Must Remember Before Exam
+Generate 5–10 extremely important facts that students should remember just before entering the exam hall.
+
+Requirements:
+- Generate between 8 and 15 memory tricks.
+- Make every trick different.
+- Use headings.
+- Use bullet points.
+- Make the output attractive and easy to revise.
+- Do not generate questions.
+- Do not generate flashcards.
+- Do not explain every topic in detail.
+- Keep every trick short.
+- Everything must come only from the provided notes.
+
+Notes:
+{memory_context}
+
+Memory Tricks:
+"""
+                            resp = gemini_model.generate_content(memory_prompt)
+                            if len(active_chunks) > 1:
+                                full_memory_tricks += f"### 📘 {doc_name}\n\n{resp.text}\n\n---\n\n"
+                            else:
+                                full_memory_tricks += resp.text
+
+                    add_workspace_card("memorytricks", "🧠 Memory Tricks", full_memory_tricks, "card-memorytricks")
+                    st.rerun()
+                except Exception as e:
+                    handle_gemini_error(e)
+
+
+        # ==========================================================
+        # RENDER WORKSPACE CARDS
+        # ==========================================================
+
+        if not st.session_state.workspace_cards:
+            st.markdown("""
+            <div class="empty-state" style="padding:40px 20px; background:#131826;
+                border:1px solid #1E2438; border-radius:14px;">
+                <div class="empty-state-icon">🗂️</div>
+                <div class="empty-state-text">
+                    Your study workspace is empty.<br>
+                    Ask a question or generate study material<br>to see cards appear here.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        else:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+
+            for card in list(st.session_state.workspace_cards):
+                card_id   = card["id"]
+                collapsed = card.get("collapsed", False)
+                ago       = time_ago(card["time"])
+
+                # Card header HTML
+                st.markdown(f"""
+                <div class="study-card {card['color']}">
+                    <div class="study-card-header">
+                        <div class="study-card-left">
+                            <div>
+                                <div class="study-card-title">{card['title']}</div>
+                                <div class="study-card-time">Generated {ago}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="study-card-divider"></div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Copy toast
+                if st.session_state.get(f"copied_{card_id}"):
+                    st.markdown('<div class="copy-toast">✅ Copied Successfully</div>', unsafe_allow_html=True)
+                    if time.time() - st.session_state.get(f"copied_at_{card_id}", 0) > 2:
+                        del st.session_state[f"copied_{card_id}"]
+
+                # ── 4-button row: Collapse | Copy | Delete | Download PDF ──
+                b1, b2, b3, b4 = st.columns([1, 1, 1, 1.2])
+
+                with b1:
+                    label = "▶ Expand" if collapsed else "▼ Collapse"
+                    if st.button(label, key=f"col_{card_id}", use_container_width=True):
+                        for c in st.session_state.workspace_cards:
+                            if c["id"] == card_id:
+                                c["collapsed"] = not c["collapsed"]
+                        st.rerun()
+
+                with b2:
+                    if st.button("📋 Copy", key=f"copy_{card_id}", use_container_width=True):
+                        safe_content = card["content"].replace("`", "\\`")
+                        copy_js = f"""
+                        <script>
+                        (function() {{
+                            if (navigator.clipboard && window.isSecureContext) {{
+                                navigator.clipboard.writeText(`{safe_content}`).catch(function() {{ fallbackCopy(); }});
+                            }} else {{ fallbackCopy(); }}
+                            function fallbackCopy() {{
+                                var ta = document.createElement("textarea");
+                                ta.value = `{safe_content}`;
+                                ta.style.position = "fixed"; ta.style.left = "-9999px";
+                                document.body.appendChild(ta); ta.focus(); ta.select();
+                                document.execCommand("copy"); document.body.removeChild(ta);
+                            }}
+                        }})();
+                        </script>
+                        """
+                        components.html(copy_js, height=0)
+                        st.session_state[f"copied_{card_id}"]    = True
+                        st.session_state[f"copied_at_{card_id}"] = time.time()
+                        st.rerun()
+
+                with b3:
+                    if st.button("🗑 Delete", key=f"del_{card_id}", use_container_width=True):
+                        st.session_state.workspace_cards = [
+                            c for c in st.session_state.workspace_cards
+                            if c["id"] != card_id
+                        ]
+                        st.session_state.pop(f"copied_{card_id}", None)
+                        st.session_state.pop(f"copied_at_{card_id}", None)
+                        st.rerun()
+
+                # ── Day 17: Download PDF (per card) ──
+                with b4:
+                    fname_stem = safe_filename(card["title"])
+                    pdf_buf    = build_pdf_single(card, st.session_state.search_scope)
+                    st.download_button(
+                        label="📥 Download PDF",
+                        data=pdf_buf,
+                        file_name=f"{fname_stem}_{today_str}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key=f"dl_pdf_{card_id}"
+                    )
+
+                # Card body
+                if not collapsed:
+                    st.markdown('<div class="study-card-body">', unsafe_allow_html=True)
+                    st.markdown(card["content"])
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+                st.write("")
+
+
+# ==========================================================
+# EMPTY STATE
+# ==========================================================
+
+else:
+    st.markdown("""
+    <div style="text-align:center; padding:50px 20px; background:#131826;
+        border:1px dashed #1E2438; border-radius:18px; margin-top:14px;">
+        <div style="font-size:52px; margin-bottom:16px;">📘</div>
+        <div style="font-size:20px; font-weight:700; color:#FFFFFF; margin-bottom:8px;">
+            Upload your first notes to begin
+        </div>
+        <div style="font-size:14px; color:#4A5578; line-height:1.7; max-width:420px; margin:0 auto;">
+            Drag PDFs into the upload card above.<br>
+            The AI will read your notes and help you study smarter —<br>
+            summaries, questions, MCQs, memory tricks and more.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ==========================================================
+# FOOTER
+# ==========================================================
+
+st.markdown("""
+<div class="app-footer">
+    📘 AI Exam Preparation Assistant &nbsp;•&nbsp; Version 1.3 &nbsp;•&nbsp; Built for Students &nbsp;•&nbsp; Day 17 / 30
+</div>
+""", unsafe_allow_html=True)
