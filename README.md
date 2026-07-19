@@ -118,3 +118,8 @@ B.Tech CSE (Artificial Intelligence)
 Indira Gandhi Delhi Technical University for Women (IGDTUW)
 
 ---
+## Live Demo
+
+https://ai-exam-preparation-assistant.streamlit.app/
+
+---
